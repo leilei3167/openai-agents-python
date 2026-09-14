@@ -25,7 +25,7 @@ from agents import (
     TResponseInputItem,
 )
 from agents.decorators import tool
-from agents.extensions.memory.encrypt_session import EncryptedSession
+from agents.extensions.memory.encrypt_session import EncryptedSession, EncryptedSessionError
 from agents.memory import OpenAIResponsesCompactionSession
 from agents.memory.openai_responses_compaction_session import OpenAIResponsesCompactionMode
 from agents.testing import ModelStep, ScriptedModel
@@ -892,6 +892,71 @@ async def test_encrypted_session_pop_expired(
 
     popped = await session.pop_item()
     assert popped is None
+
+    underlying_session.close()
+
+
+async def test_encrypted_session_pop_wrong_key_does_not_drain_store(
+    underlying_session: SQLiteSession,
+):
+    """Wrong-key pop must refuse without deleting recoverable ciphertext."""
+    messages: list[TResponseInputItem] = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "user", "content": "follow-up"},
+    ]
+    correct = EncryptedSession(
+        session_id="test_session",
+        underlying_session=underlying_session,
+        encryption_key="example-correct-key",
+        ttl=3600,
+    )
+    wrong = EncryptedSession(
+        session_id="test_session",
+        underlying_session=underlying_session,
+        encryption_key="example-wrong-key",
+        ttl=3600,
+    )
+
+    await correct.add_items(messages)
+    assert await correct.get_items() == messages
+    assert len(await underlying_session.get_items()) == 3
+
+    with pytest.raises(EncryptedSessionError):
+        await wrong.pop_item()
+
+    assert len(await underlying_session.get_items()) == 3
+    assert await correct.get_items() == messages
+    assert await correct.pop_item() == messages[-1]
+    assert await correct.get_items() == messages[:-1]
+
+    underlying_session.close()
+
+
+async def test_encrypted_session_pop_skips_expired_then_returns_valid(
+    encryption_key: str, underlying_session: SQLiteSession, set_fernet_time
+):
+    """Expired ciphertext is still skipped; pop continues to a newer valid item."""
+    set_fernet_time(1_000)
+    session = EncryptedSession(
+        session_id="test_session",
+        underlying_session=underlying_session,
+        encryption_key=encryption_key,
+        ttl=10,
+    )
+
+    await session.add_items([{"role": "user", "content": "expired"}])
+    expired = (await underlying_session.get_items())[0]
+    set_fernet_time(1_020)
+    await session.add_items([{"role": "user", "content": "still valid"}])
+    # Place expired ciphertext on top so pop must skip it to reach the valid item.
+    await underlying_session.add_items([expired])
+
+    popped = await session.pop_item()
+    assert popped is not None
+    assert popped.get("content") == "still valid"
+    assert await session.pop_item() is None
+    assert await underlying_session.get_items() == []
 
     underlying_session.close()
 

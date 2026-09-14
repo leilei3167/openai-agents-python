@@ -57,6 +57,14 @@ class EncryptedEnvelope(TypedDict):
     payload: str
 
 
+class EncryptedSessionError(Exception):
+    """Raised when an encrypted session item fails authentication (for example, wrong key)."""
+
+    def __init__(self, message: str = "Failed to decrypt session item; check encryption_key."):
+        self.message = message
+        super().__init__(message)
+
+
 def _ensure_fernet_key_bytes(master_key: str) -> bytes:
     """
     Accept either a Fernet key (urlsafe-b64, 32 bytes after decode) or a raw string.
@@ -210,17 +218,35 @@ class EncryptedSession(SessionABC):
 
         try:
             token = item["payload"].encode("utf-8")
-            plaintext = self.cipher.decrypt(token, ttl=self.ttl)
-            return cast(TResponseInputItem, _from_json_bytes(plaintext))
-        except (InvalidToken, KeyError):
+        except (KeyError, AttributeError):
             return None
+
+        try:
+            plaintext = self.cipher.decrypt(token, ttl=self.ttl)
+        except InvalidToken:
+            # Fernet raises InvalidToken for both TTL expiry and authentication failure.
+            # Retry without TTL: success means the ciphertext is authentic but expired.
+            try:
+                self.cipher.decrypt(token)
+            except InvalidToken as exc:
+                raise EncryptedSessionError(
+                    "Failed to decrypt session item; check that encryption_key matches "
+                    "the key used to write this session."
+                ) from exc
+            return None
+
+        return cast(TResponseInputItem, _from_json_bytes(plaintext))
 
     def _unwrap_valid_items(
         self, encrypted_items: list[TResponseInputItem]
     ) -> list[TResponseInputItem]:
         valid_items: list[TResponseInputItem] = []
         for enc in encrypted_items:
-            item = self._unwrap(enc)
+            try:
+                item = self._unwrap(enc)
+            except EncryptedSessionError:
+                # Non-destructive reads skip unreadable envelopes without deleting them.
+                continue
             if item is not None:
                 valid_items.append(item)
         return valid_items
@@ -290,7 +316,17 @@ class EncryptedSession(SessionABC):
             )
             if not enc:
                 return None
-            item = self._unwrap(enc)
+            try:
+                item = self._unwrap(enc)
+            except EncryptedSessionError:
+                # Restore the popped ciphertext before refusing, so a wrong key does not
+                # drain recoverable history through the TTL skip loop.
+                await _call_session_method(
+                    self.underlying_session.add_items,
+                    [enc],
+                    wrapper=wrapper,
+                )
+                raise
             if item is not None:
                 return item
 
